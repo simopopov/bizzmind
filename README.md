@@ -5,6 +5,18 @@ small working app, so you don't have to buy a separate BI tool.**
 
 **Live app:** https://bizzmind-lac.vercel.app/
 
+## Try the demo
+
+Sign in at https://bizzmind-lac.vercel.app/login with the shared demo account:
+
+| | |
+|---|---|
+| Email | `demo-hackathon@example.com` |
+| Password | `Bizzmind-n139CrvGV6wB8xvPWz8A!` |
+
+The account has 30,000 credits and no automatic top-up. Open the
+**Hackathon Demo Playground** project to start.
+
 ## The problem
 
 Many small and mid-sized companies run on Excel. Over the years their workbooks
