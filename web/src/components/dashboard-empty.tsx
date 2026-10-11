@@ -1,0 +1,68 @@
+"use client";
+import { useT } from "@/lib/i18n";
+import { Mark } from "@/components/logo";
+import { Button } from "@/components/ui/button";
+import { Upload, Wallet } from "lucide-react";
+import { useBuyCredits } from "@/components/buy-credits";
+
+export function DashboardEmpty({ onStart, hasTables = false, quote }: {
+  onStart: () => void; hasTables?: boolean;
+  quote?: { credits: number; remaining: number; affordable: boolean; expensive?: boolean };
+}) {
+  const t = useT();
+  const buyCredits = useBuyCredits();
+  const steps = [t("step_upload"), t("step_interview"), t("step_dashboard")];
+  return (
+    <div className="flex min-h-[55vh] flex-col items-center justify-center gap-5 text-center">
+      <Mark size={56} className="opacity-90" />
+      <h2 className="text-xl font-extrabold">{t("dash_empty_title")}</h2>
+      <p className="max-w-lg text-sm leading-relaxed text-muted-foreground">{t("dash_empty_text")}</p>
+      <ol className="flex flex-wrap items-center justify-center gap-4 text-[13px]">
+        {steps.map((s, i) => (
+          <li key={s} className={`flex items-center gap-2 ${i === 0 ? "text-foreground" : "text-muted-foreground"}`}>
+            <b className={`inline-flex size-6 items-center justify-center rounded-lg text-xs ${i === 0 ? "grad-olive text-primary-foreground" : "border border-border"}`}>{i + 1}</b>
+            {s}
+          </li>
+        ))}
+      </ol>
+      <Button onClick={onStart} disabled={hasTables && quote?.affordable === false}
+        className="grad-olive font-bold text-primary-foreground hover:opacity-90">
+        <Upload className="size-4" />{hasTables ? t("start_analysis") : t("start_upload")}
+      </Button>
+      {hasTables && quote?.affordable !== false && quote?.expensive && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-700 dark:text-amber-300">
+          {t("cost_warn")}
+        </div>
+      )}
+      {hasTables && quote?.affordable === false ? (
+        <div className="flex flex-col items-center gap-3">
+          <div className="text-[12.5px] font-semibold text-destructive">
+            {t("quote_short", { n: quote.credits, left: quote.remaining })}
+          </div>
+          <Button size="sm" className="grad-olive font-bold text-primary-foreground hover:opacity-90"
+            onClick={() => buyCredits(quote?.credits)}>
+            <Wallet className="size-4" />{t("buy_credits")}
+          </Button>
+        </div>
+      ) : hasTables ? (
+        <div className="text-[12px] text-muted-foreground">{t("start_analysis_hint")}</div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Every tab owns fetches of its own — none of them may paint an empty or,
+ *  worse, a wrong screen ("no app yet") while its first request is in flight. */
+export function TabLoading({ label }: { label?: string }) {
+  const t = useT();
+  return (
+    <div className="flex min-h-[55vh] flex-col items-center justify-center gap-4 text-sm text-muted-foreground">
+      <span className="size-9 animate-spin rounded-full border-[3px] border-border border-t-olive" />
+      {label ?? t("loading_project")}
+    </div>
+  );
+}
+
+export function DashboardLoading() {
+  return <TabLoading />;
+}

@@ -1,0 +1,500 @@
+"""Login / register / logout / me and organisation members."""
+
+import db
+import auth as sb_auth
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from bizzmind.config import log
+from bizzmind.i18n import T, req_lang
+from bizzmind.auth_middleware import _set_auth_cookies
+from bizzmind import plans
+
+router = APIRouter()
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@router.post("/api/auth/login")
+def auth_login(req: LoginRequest, request: Request):
+    try:
+        tokens = sb_auth.sign_in(req.email, req.password)
+    except sb_auth.AuthError as e:
+        log.info(f"auth: failed login for '{req.email}' ({e.status})")
+        if e.status >= 500:
+            return JSONResponse({"detail": e.detail}, status_code=503)
+        return JSONResponse({"detail": T(req_lang(request), "bad_credentials")}, status_code=401)
+    email = (tokens.get("user") or {}).get("email", req.email.strip().lower())
+    log.info(f"auth: '{email}' logged in")
+    resp = JSONResponse({"ok": True, "email": email})
+    _set_auth_cookies(resp, tokens)
+    return resp
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+    redirect: str = ""      # origin of the app the user registered from (confirmation link target)
+
+
+@router.post("/api/auth/register")
+def auth_register(req: RegisterRequest, request: Request):
+    lang = req_lang(request)
+    if len(req.password) < 8:
+        return JSONResponse({"detail": T(lang, "password_short")}, status_code=400)
+    try:
+        redirect = req.redirect.strip() or (request.headers.get("origin") or "").rstrip("/")
+        res = sb_auth.sign_up(req.email, req.password, req.name,
+                              redirect_to=(redirect + "/login") if redirect.startswith("http") else None)
+    except sb_auth.AuthError as e:
+        log.info(f"auth: register failed for '{req.email}' ({e.status}: {e.detail})")
+        if e.status == 422 or "already" in e.detail.lower():
+            return JSONResponse({"detail": T(lang, "email_taken")}, status_code=409)
+        return JSONResponse({"detail": e.detail}, status_code=400 if e.status < 500 else 503)
+    log.info(f"auth: registered '{req.email}'")
+    if res.get("access_token"):
+        # confirmation disabled in Supabase -> signed in straight away
+        resp = JSONResponse({"ok": True, "email": req.email.strip().lower(), "confirmed": True})
+        _set_auth_cookies(resp, res)
+        return resp
+    return {"ok": True, "email": req.email.strip().lower(), "confirmed": False,
+            "message": T(lang, "confirm_email")}
+
+
+class InviteRequest(BaseModel):
+    email: str
+    role: str = "member"
+
+
+@router.get("/api/org/members")
+def org_members():
+    u = sb_auth.current_user()
+    org = u.orgs[0] if u and u.orgs else None
+    if not org:
+        raise HTTPException(404, "no organisation")
+    return {"org_id": org, "members": sb_auth.org_members(db, org), "me": u.id}
+
+
+@router.post("/api/org/invite")
+def org_invite(req: InviteRequest, request: Request):
+    """Admins invite colleagues: Supabase sends the invite email; on first login
+    the invitee is attached to this organisation (pending_invites)."""
+    u = sb_auth.current_user()
+    org = u.orgs[0] if u and u.orgs else None
+    lang = req_lang(request)
+    if not org or not u.can_admin(org):
+        raise HTTPException(403, T(lang, "forbidden"))
+    if req.role not in ("admin", "member"):
+        raise HTTPException(400, "bad role")
+    email = req.email.strip().lower()
+    try:
+        invited = sb_auth.admin_invite(email, redirect_to=str(request.base_url).rstrip("/") + "/login")
+    except sb_auth.AuthError as e:
+        if e.status == 422 or "already" in e.detail.lower():
+            # existing account -> attach directly
+            match = [x for x in sb_auth.admin_list_users() if x.get("email") == email]
+            if not match:
+                raise HTTPException(400, e.detail)
+            sb_auth.add_member(db, org, match[0]["id"], req.role)
+            return {"ok": True, "attached": True}
+        raise HTTPException(400 if e.status < 500 else 503, e.detail)
+    sb_auth.add_member(db, org, invited["id"], req.role)
+    log.info(f"auth: {u.email} invited {email} as {req.role}")
+    return {"ok": True, "invited": True}
+
+
+@router.delete("/api/org/members/{user_id}")
+def org_remove(user_id: str, request: Request):
+    u = sb_auth.current_user()
+    org = u.orgs[0] if u and u.orgs else None
+    if not org or not u.can_admin(org):
+        raise HTTPException(403, T(req_lang(request), "forbidden"))
+    if user_id == u.id:
+        raise HTTPException(400, "cannot remove yourself")
+    sb_auth.remove_member(db, org, user_id)
+    return {"ok": True}
+
+
+@router.post("/api/auth/logout")
+def auth_logout(request: Request):
+    access = request.cookies.get(sb_auth.ACCESS_COOKIE)
+    if access:
+        sb_auth.sign_out(access)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(sb_auth.ACCESS_COOKIE)
+    resp.delete_cookie(sb_auth.REFRESH_COOKIE)
+    log.info("auth: logged out")
+    return resp
+
+
+@router.get("/api/auth/me")
+def auth_me(request: Request):
+    u = sb_auth.current_user()
+    if not u:
+        return JSONResponse({"detail": "not logged in"}, status_code=401)
+    return {"email": u.email, "id": u.id, "orgs": u.orgs, "roles": u.roles}
+
+
+# ------------------------------------------------------------------ account
+
+class PasswordChange(BaseModel):
+    password: str
+
+
+class AccountPrefs(BaseModel):
+    auto_recharge: bool
+
+
+class BillingInfo(BaseModel):
+    company: str = ""
+    eik: str = ""           # company registration number (ЕИК/Bulstat)
+    vat_id: str = ""        # VAT number
+    mol: str = ""           # authorised representative
+    address: str = ""
+    city: str = ""
+    country: str = ""
+    invoice_email: str = ""
+
+
+def _me_org():
+    u = sb_auth.current_user()
+    if not u:
+        raise HTTPException(401)
+    return u, (u.orgs[0] if u.orgs else None)
+
+
+@router.get("/api/plans")
+def public_plans():
+    """Public: plan definitions for the pricing page (no auth, no org data)."""
+    return {"plans": plans.PLANS, "packs": plans.PACKS, "costs": plans.COSTS}
+
+
+def _account_snapshot(org):
+    """Everything the account view needs in ONE database round trip."""
+    if org is None:
+        return None
+    with plans.pool().connection() as con:
+        row = con.execute(
+            "SELECT o.plan, o.credits_quota, o.credits_extra, o.credits_used, o.auto_recharge, "
+            "       o.name, o.billing, o.paddle_customer_id, o.paddle_subscription_id, "
+            "       (SELECT count(*) FROM public.projects p WHERE p.org_id = o.id), "
+            "       (SELECT coalesce(jsonb_agg(jsonb_build_object('kind', k, 'count', n, 'credits', c)), '[]'::jsonb) "
+            "        FROM (SELECT kind k, count(*) n, sum(credits) c FROM public.credit_events "
+            "              WHERE org_id = o.id GROUP BY kind ORDER BY sum(credits) DESC) x) "
+            "FROM public.organizations o WHERE o.id = %s", (org,)).fetchone()
+    return row
+
+
+@router.get("/api/account")
+def account(request: Request):
+    u, org = _me_org()
+    snap = _account_snapshot(org)
+    if not snap:
+        plan, quota, extra, used, auto, oname, billing, cust, sub, nproj, usage = (
+            "free", 0, 0, 0, False, "", {}, None, None, 0, [])
+    else:
+        plan, quota, extra, used, auto, oname, billing, cust, sub, nproj, usage = snap
+    if plan not in plans.PLANS:
+        plan = "free"
+    return {
+        "email": u.email,
+        "org_id": str(org) if org else None,
+        "org_name": oname,
+        "role": u.roles.get(str(org), "member") if org else "member",
+        "plan": plan,
+        "plans": plans.PLANS,
+        "costs": plans.COSTS,
+        "models": {k: {"label": v["label"], "min_plan": v["min_plan"]} for k, v in plans.MODELS.items()},
+        "packs": plans.PACKS,
+        "credits": {"quota": quota, "extra": extra, "used": used,
+                    "remaining": max(0, quota + extra - used)},
+        "auto_recharge": auto,
+        "projects_used": nproj,
+        "usage": usage or [],
+        "billing": billing or {},
+        "subscription": ({"customer_id": cust, "subscription_id": sub, "plan": plan} if sub else None),
+    }
+
+
+def _org_subscription(org) -> dict | None:
+    if org is None:
+        return None
+    with plans.pool().connection() as con:
+        row = con.execute("SELECT paddle_customer_id, paddle_subscription_id, plan "
+                          "FROM public.organizations WHERE id = %s", (org,)).fetchone()
+    if not row or not row[1]:
+        return None
+    return {"customer_id": row[0], "subscription_id": row[1], "plan": row[2]}
+
+
+def _billing_org(request: Request, admin: bool = True):
+    u, org = _me_org()
+    if org is None or (admin and not u.can_admin(org)):
+        raise HTTPException(403, T(req_lang(request), "forbidden"))
+    with plans.pool().connection() as con:
+        row = con.execute("SELECT paddle_customer_id, paddle_subscription_id "
+                          "FROM public.organizations WHERE id = %s", (org,)).fetchone()
+    if not row or not row[1]:
+        raise HTTPException(404, "no subscription")
+    return org, row[0], row[1]
+
+
+@router.get("/api/account/subscription")
+def account_subscription(request: Request):
+    """Live subscription details, served white-label from our API."""
+    from bizzmind import paddle_billing
+    try:
+        org, _cust, sub_id = _billing_org(request, admin=False)
+    except HTTPException:
+        return {"active": False}
+    d = paddle_billing.api("GET", f"/subscriptions/{sub_id}")
+    item = (d.get("items") or [{}])[0]
+    price = item.get("price") or {}
+    cycle = price.get("billing_cycle") or {}
+    sched = d.get("scheduled_change") or {}
+    return {
+        "active": d.get("status") in ("active", "trialing", "past_due"),
+        "status": d.get("status"),
+        "plan": (price.get("custom_data") or {}).get("plan"),
+        "next_billed_at": d.get("next_billed_at"),
+        "amount": (price.get("unit_price") or {}).get("amount"),
+        "currency": (price.get("unit_price") or {}).get("currency_code"),
+        "interval": cycle.get("interval"),
+        "cancel_scheduled_at": sched.get("effective_at") if sched.get("action") == "cancel" else None,
+    }
+
+
+class CancelRequest(BaseModel):
+    reason: str = ""
+    comment: str = ""
+
+
+class PlanChangeRequest(BaseModel):
+    plan: str
+    interval: str = "month"
+
+
+@router.post("/api/account/subscription/cancel")
+def account_subscription_cancel(req: CancelRequest, request: Request):
+    from bizzmind import paddle_billing
+    org, _cust, sub_id = _billing_org(request)
+    with plans.pool().connection() as con:
+        con.execute("INSERT INTO public.cancellation_feedback (org_id, subscription_id, reason, comment) "
+                    "VALUES (%s, %s, %s, %s)", (org, sub_id, req.reason[:100] or "unspecified", req.comment[:2000]))
+    paddle_billing.api("POST", f"/subscriptions/{sub_id}/cancel",
+                       {"effective_from": "next_billing_period"})
+    log.info(f"billing: cancel scheduled for {sub_id} — reason: {req.reason or 'unspecified'}")
+    return {"ok": True}
+
+
+@router.post("/api/account/subscription/change")
+def account_subscription_change(req: PlanChangeRequest, request: Request):
+    """In-app plan switch: Paddle prorates, the webhook applies the new plan."""
+    from bizzmind import paddle_billing
+    price_id = plans.PADDLE_PRICES.get((req.plan, req.interval))
+    if not price_id:
+        raise HTTPException(400, "unknown plan")
+    _org, _cust, sub_id = _billing_org(request)
+    current = paddle_billing.api("GET", f"/subscriptions/{sub_id}")
+    if current.get("scheduled_change"):
+        paddle_billing.api("PATCH", f"/subscriptions/{sub_id}", {"scheduled_change": None})
+    if current.get("status") == "trialing":
+        # no-trial policy: switching plans means paying — end the legacy trial now
+        paddle_billing.api("POST", f"/subscriptions/{sub_id}/activate", {})
+    current_price = ((current.get("items") or [{}])[0].get("price") or {}).get("id")
+    if current_price != price_id:
+        paddle_billing.api("PATCH", f"/subscriptions/{sub_id}", {
+            "items": [{"price_id": price_id, "quantity": 1}],
+            "proration_billing_mode": "prorated_immediately",
+        })
+    log.info(f"billing: {sub_id} -> {req.plan}/{req.interval} (billed immediately)")
+    return {"ok": True}
+
+
+@router.post("/api/account/subscription/keep")
+def account_subscription_keep(request: Request):
+    from bizzmind import paddle_billing
+    _org, _cust, sub_id = _billing_org(request)
+    paddle_billing.api("PATCH", f"/subscriptions/{sub_id}", {"scheduled_change": None})
+    log.info(f"billing: scheduled cancel removed for {sub_id}")
+    return {"ok": True}
+
+
+@router.post("/api/account/payment-method-txn")
+def account_payment_method_txn(request: Request):
+    """A zero-total transaction the frontend opens as an overlay to change the card."""
+    from bizzmind import paddle_billing
+    _org, _cust, sub_id = _billing_org(request)
+    d = paddle_billing.api("GET", f"/subscriptions/{sub_id}/update-payment-method-transaction")
+    return {"transaction_id": d.get("id")}
+
+
+@router.get("/api/account/payment-methods")
+def account_payment_methods(request: Request):
+    """Standalone saved cards (subscription-bound cards are not listed by Paddle)."""
+    from bizzmind import paddle_billing
+    u, org = _me_org()
+    if org is None:
+        return {"cards": []}
+    with plans.pool().connection() as con:
+        row = con.execute("SELECT paddle_customer_id FROM public.organizations WHERE id = %s", (org,)).fetchone()
+    if not row or not row[0]:
+        return {"cards": []}
+    pms = paddle_billing.api("GET", f"/customers/{row[0]}/payment-methods")
+    out = []
+    for pm in pms if isinstance(pms, list) else []:
+        card = pm.get("card") or {}
+        out.append({"id": pm.get("id"), "type": card.get("type", pm.get("type", "")),
+                    "last4": card.get("last4", "")})
+    return {"cards": out}
+
+
+class RemoveCardRequest(BaseModel):
+    id: str
+
+
+@router.post("/api/account/payment-method/remove")
+def account_payment_method_remove(req: RemoveCardRequest, request: Request):
+    from bizzmind import paddle_billing
+    u, org = _me_org()
+    if org is None or not u.can_admin(org):
+        raise HTTPException(403, T(req_lang(request), "forbidden"))
+    with plans.pool().connection() as con:
+        row = con.execute("SELECT paddle_customer_id FROM public.organizations WHERE id = %s", (org,)).fetchone()
+    if not row or not row[0]:
+        raise HTTPException(404)
+    paddle_billing.api("DELETE", f"/customers/{row[0]}/payment-methods/{req.id}")
+    log.info(f"billing: payment method {req.id} removed for org {org}")
+    return {"ok": True}
+
+
+class BuyCreditsRequest(BaseModel):
+    credits: int
+
+
+@router.post("/api/account/buy-credits")
+def account_buy_credits(req: BuyCreditsRequest, request: Request):
+    """One-click pack purchase: bill the org's saved payment method through
+    Paddle. Falls back to {status: "checkout"} when there is nothing saved —
+    the frontend then opens the normal checkout overlay."""
+    import time as _time
+    from bizzmind import paddle_billing
+    u, org = _me_org()
+    lang = req_lang(request)
+    if org is None or not u.can_admin(org):
+        raise HTTPException(403, T(lang, "forbidden"))
+    pack = next((p for p in plans.PACKS if p["credits"] == req.credits), None)
+    if not pack:
+        raise HTTPException(400, "unknown pack")
+    price_id = plans.PACK_PADDLE_PRICES.get(req.credits)
+    with plans.pool().connection() as con:
+        row = con.execute("SELECT paddle_customer_id FROM public.organizations WHERE id = %s",
+                          (org,)).fetchone()
+    cust = row[0] if row else None
+    if not cust or not price_id:
+        return {"status": "checkout"}
+    try:
+        txn = paddle_billing.api("POST", "/transactions", {
+            "items": [{"price_id": price_id, "quantity": 1}],
+            "customer_id": cust,
+            "collection_mode": "automatic",
+            "custom_data": {"org_id": str(org)},
+        })
+    except HTTPException:
+        return {"status": "checkout"}
+    txn_id = txn.get("id")
+    for _ in range(10):                      # the charge is async; give it a few seconds
+        if txn.get("status") in ("completed", "paid"):
+            return {"status": "charged", "transaction_id": txn_id}
+        if txn.get("status") in ("canceled", "past_due"):
+            return {"status": "checkout"}
+        _time.sleep(1)
+        txn = paddle_billing.api("GET", f"/transactions/{txn_id}")
+    return {"status": "pending", "transaction_id": txn_id}
+
+
+@router.get("/api/account/invoices")
+def account_invoices(request: Request):
+    from bizzmind import paddle_billing
+    try:
+        _org, cust, sub_id = _billing_org(request, admin=False)
+    except HTTPException:
+        return {"invoices": []}
+    d = paddle_billing.api("GET", f"/transactions?subscription_id={sub_id}&per_page=12")
+    out = []
+    for t in d if isinstance(d, list) else []:
+        totals = (t.get("details") or {}).get("totals") or {}
+        out.append({"id": t.get("id"), "date": (t.get("billed_at") or t.get("created_at") or "")[:10],
+                    "total": totals.get("total"), "currency": t.get("currency_code"),
+                    "status": t.get("status"), "number": t.get("invoice_number")})
+    return {"invoices": out}
+
+
+@router.get("/api/account/invoice/{txn_id}")
+def account_invoice_pdf(txn_id: str, request: Request):
+    """Invoice PDF streamed through our own domain (white-label)."""
+    import urllib.request
+    from fastapi.responses import StreamingResponse
+    from bizzmind import paddle_billing
+    _org, cust, _sub = _billing_org(request, admin=False)
+    txn = paddle_billing.api("GET", f"/transactions/{txn_id}")
+    if txn.get("customer_id") != cust:
+        raise HTTPException(403, T(req_lang(request), "forbidden"))
+    d = paddle_billing.api("GET", f"/transactions/{txn_id}/invoice")
+    url = d.get("url")
+    if not url:
+        raise HTTPException(404)
+    r = urllib.request.urlopen(url, timeout=60)
+    return StreamingResponse(r, media_type="application/pdf",
+                             headers={"Content-Disposition": f'attachment; filename="invoice-{txn_id[-8:]}.pdf"'})
+
+
+def _org_billing(org) -> dict:
+    if org is None:
+        return {}
+    with plans.pool().connection() as con:
+        row = con.execute("SELECT billing FROM public.organizations WHERE id = %s", (org,)).fetchone()
+    return row[0] if row and row[0] else {}
+
+
+@router.post("/api/account/billing")
+def account_billing(req: BillingInfo, request: Request):
+    import json as _json
+    u, org = _me_org()
+    if org is None or not u.can_admin(org):
+        raise HTTPException(403, T(req_lang(request), "forbidden"))
+    with plans.pool().connection() as con:
+        con.execute("UPDATE public.organizations SET billing = %s::jsonb WHERE id = %s",
+                    (_json.dumps(req.model_dump()), org))
+    log.info(f"account: billing details updated for org {org}")
+    return {"ok": True}
+
+
+@router.post("/api/account/password")
+def account_password(req: PasswordChange, request: Request):
+    u, _ = _me_org()
+    lang = req_lang(request)
+    if len(req.password) < 8:
+        raise HTTPException(400, T(lang, "password_short"))
+    try:
+        sb_auth.admin_update_password(u.id, req.password)
+    except sb_auth.AuthError as e:
+        raise HTTPException(e.status, e.detail)
+    log.info(f"account: password changed for {u.email}")
+    return {"ok": True}
+
+
+@router.post("/api/account/prefs")
+def account_prefs(req: AccountPrefs, request: Request):
+    u, org = _me_org()
+    if org is None or not u.can_admin(org):
+        raise HTTPException(403, T(req_lang(request), "forbidden"))
+    with plans.pool().connection() as con:
+        con.execute("UPDATE public.organizations SET auto_recharge = %s WHERE id = %s",
+                    (req.auto_recharge, org))
+    return {"ok": True, "auto_recharge": req.auto_recharge}

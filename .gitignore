@@ -1,0 +1,29 @@
+# virtualenv, caches
+.venv/
+__pycache__/
+*.pyc
+# secrets & runtime
+.env
+.codex/
+server.log
+.DS_Store
+# client data: projects, uploads, sessions, users — never in git
+data/*
+!data/.gitkeep
+worker.log
+web-dev.log
+
+# клиентски/работни файлове в корена
+/*.xlsx
+/*.xls
+/*.csv
+web/shot.tmp.mjs
+.vercel
+
+# local run logs
+web.log
+server.log
+worker.log
+
+# local browser-automation logs
+.playwright-mcp/
